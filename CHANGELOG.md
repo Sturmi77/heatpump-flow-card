@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+Samsung EHS preset.
+- New preset `samsung` for Samsung EHS heat pumps (Mono, Split, TDM) with Beormund's ESPHome component esphome-samsung-nasa. Based on its message mapping; entity names from its example.yaml and README plus a tested installation (EHS Mono AE050JXYDEH). Detected by the 3-way valve together with the error code.
+- The diverter valve also counts as hot water on the state "Tank (DHW)".
+- Presets can name the text states of their error sensors that mean "no error" (`error_ok`); any other text then shows the error chip. Samsung reports "No Error" or a description of the fault.
+- Self-test: 432 checks.
+
 ## 0.9.3 – 2026-10-24
 Timeline of the operating mode, a fading heating surface, and no more clash with other cards of the same name.
 - Timeline (`timeline: true`, `timeline_hours`): a strip under the schematic shows heating, hot water, defrost, blocked and standby over the last 24 hours (3 to 72), from the history of the `mode` entity; without it from the `compressor` and the `valve`. Tap or arrow keys show start, end and duration. One history query per card, kept for five minutes. Also in the editor.

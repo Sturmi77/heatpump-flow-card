@@ -94,7 +94,7 @@
 
   // 5. detection: the right preset for each installation, nothing for gas boilers or foreign entities
   const stub = (states, registry) => C.getStubConfig(hassOf(toStates(states), registry));
-  const expect = { 0: 'lambda', 1: 'lambda', 2: 'vicare', 3: 'vaillant', 4: 'emsesp', 5: 'heishamon', 6: 'emsesp' };
+  const expect = { 0: 'lambda', 1: 'lambda', 2: 'vicare', 3: 'vaillant', 4: 'emsesp', 5: 'heishamon', 6: 'emsesp', 7: 'samsung' };
   for (const [i, p] of Object.entries(expect)) {
     const s = setups[i]; const st = stub(s.states('heat'), s.registry || {});
     check(st.preset === p, `stub preset ${i} = ${p} (got ${st.preset})`);
@@ -105,6 +105,7 @@
   check(!detects('vicare', { 'sensor.vitodens_outside_temperature': '5', 'sensor.vitodens_boiler_temperature': '60' },
     { 'sensor.vitodens_outside_temperature': { platform: 'vicare', translation_key: 'outside_temperature' } }), 'ViCare gas boiler is not a heat pump');
   check(!detects('lambda', { 'sensor.other_hp1_operating_state': 'x' }, { 'sensor.other_hp1_operating_state': { platform: 'something_else' } }), 'foreign hp1_operating_state is not Lambda');
+  check(!detects('samsung', { 'sensor.boiler_3_way_valve': 'Room' }, { 'sensor.boiler_3_way_valve': { platform: 'esphome' } }), 'a 3-way valve without the Samsung error code is not Samsung');
 
   // 6. computed values
   {
@@ -543,6 +544,28 @@
     const one = mount(s.config, hass); await wait(10);
     check(one.shadowRoot.querySelectorAll('.hop').length === 0, 'single circuit has no bridge');
     one.remove();
+  }
+
+  // 13b. Samsung EHS: text valve "Tank (DHW)", text error code with "No Error", tiles from the example.yaml template sensors
+  {
+    const s = setups[7];
+    const sam = async (scen, extra = {}) => {
+      const card = mount(s.config, hassOf(toStates({ ...s.states(scen), ...extra }), s.registry)); await wait(20);
+      const r = { mode: card.shadowRoot.getElementById('chip-mode').className, err: card.shadowRoot.getElementById('chip-err').classList.contains('on') };
+      card.remove(); return r;
+    };
+    let r = await sam('dhw');
+    check(/mode-dhw/.test(r.mode) && !r.err, `Samsung valve "Tank (DHW)" is hot water, "No Error" is no error (${JSON.stringify(r)})`);
+    r = await sam('heat');
+    check(/mode-heat/.test(r.mode) && !r.err, `Samsung "Room (Heating)" is heating (${JSON.stringify(r)})`);
+    r = await sam('idle');
+    check(/mode-idle/.test(r.mode) && r.err, `Samsung error text shows the error chip (${JSON.stringify(r)})`);
+    r = await sam('heat', { 'sensor.heat_pump_error_code': 'unavailable' });
+    check(!r.err, 'Samsung error code unavailable is no error');
+    r = await sam('heat', { 'sensor.heat_pump_error_code': '0', 'sensor.heat_pump_3_way_valve': '1' });
+    check(/mode-dhw/.test(r.mode) && !r.err, `Samsung valve and error code as plain sensors (${JSON.stringify(r)})`);
+    const { t } = await tilesOf(s, ['energy', 'heat', 'cop_total', 'energy:total']);
+    check(t['Electricity · today'] === '4.3 kWh' && t['COP total · today'] === '3.74' && t['Electricity · total'] === '1,843 kWh', `Samsung tiles (${JSON.stringify(t)})`);
   }
 
   // 14. outdoor unit drawings: style per preset, Vaillant sizes, fans and snowflakes, loop symbol for ground sources

@@ -3,7 +3,7 @@
  * Animated hydraulic schematic for air-to-water heat pumps in Home Assistant:
  * power sources (PV / battery / grid) → heat pump → diverter valve → DHW tank / buffer → heating circuit.
  * Vendor-neutral core with presets: Lambda, Viessmann (ViCare), Vaillant (myPyllant),
- * EMS-ESP (Bosch, Buderus, Junkers, Nefit, Worcester …) and Panasonic Aquarea (HeishaMon).
+ * EMS-ESP (Bosch, Buderus, Junkers, Nefit, Worcester …), Panasonic Aquarea (HeishaMon) and Samsung EHS (esphome-samsung-nasa).
  *
  * https://github.com/Sturmi77/heatpump-flow-card · MIT License
  */
@@ -16,6 +16,7 @@ const HFC_VERSION = '0.9.3';
 //   detect(ctx)                → prefix (string, may be '') or undefined when the integration is not present
 //   entities(prefix, idx, ctx) → { key: entity_id | [candidates…] }  (first existing candidate wins)
 //   errors(prefix, idx, ctx)   → error sensors (numeric ≠ 0 or binary "on" shows the error chip)
+//   error_ok                   → text states of the error sensors that mean "no error" (any other text shows the chip)
 //   tiles(prefix, idx, ctx)    → { tile: { period: entity_id | [candidates…] } } for the stat tile catalog (HFC_TILES);
 //                                a "total" counter with long-term statistics also gives today, yesterday, week, month and year
 //   *_mode_map                 → raw state → normalized mode
@@ -363,6 +364,69 @@ const HFC_PRESETS = {
         energy_cooling: { now: `${m}cool_power_consumption` }, heat_cooling: { now: `${m}cool_power_production` },
         starts: { total: `${m}operations_counter` }, hours: { total: `${m}operations_hours` },
         aux_hours: { total: `${m}room_heater_operations_hours` },
+      };
+    },
+  },
+
+  // Samsung EHS (Mono, Split, TDM) over the NASA bus with the ESPHome component "esphome-samsung-nasa" by Beormund.
+  // ESPHome entity ids are <node>_<name slug>, and the names are set in each user's YAML. The candidates are the names
+  // of Beormund's example.yaml and README, then those of the installation the preset was tested on (EHS Mono AE050JXYDEH).
+  samsung: {
+    name: 'Samsung EHS (esphome-samsung-nasa)',
+    tested: true,
+    auto_circuits: false,
+    // The 3-way valve (0x4067) and the error code (0x8235) together: a plain "3-way valve" alone could be any ESPHome node.
+    detect: (ctx) => {
+      const re = /^sensor\.(.+)_3_way_valve(?:_position)?$/;
+      const id = ctx.match(re, 'esphome');
+      const p = id && id.match(re)[1];
+      return p && [`sensor.${p}_error_code`, `sensor.${p}_system_error_status`].some((e) => ctx.ids.includes(e)) ? p : undefined;
+    },
+    entities: (p, i) => {
+      const s = (...ks) => ks.map((k) => `sensor.${p}_${k}`);
+      const b = (...ks) => ks.map((k) => `binary_sensor.${p}_${k}`);
+      const z = i.hc;
+      // No hc_pump: the primary water pump (0x4089) also runs for hot water, so the circuit follows the valve instead.
+      return {
+        compressor: b('compressor_status', 'compressor').concat(s('compressor_frequency')),
+        defrost: b('defrost', 'defrost_mode', 'defrost_status'),
+        valve: s('3_way_valve', '3_way_valve_position'),
+        heater: b('backup_heater'),
+        power: s('power_consumed_last_minute', 'power'),
+        heat: s('power_produced_last_minute', 'heat_produced_last_minute'),
+        flow: s('flow_temp_out', 'flow_temperature'),
+        return: s('flow_temp_return', 'return_temperature'),
+        volume: s('flow_rate_sensor', 'water_flow'),
+        outdoor: s('outdoor_temperature'),
+        dhw_top: s('dhw_temperature', 'dhw_tank_temperature'),
+        dhw_target: [`number.${p}_dhw_target_temperature`, `sensor.${p}_dhw_target_temperature`],
+        dhw_heater: b('booster_heater'),
+        // Without a mixing kit zone 1 is fed straight from the heat pump outlet.
+        hc_flow: z === 1 ? s('flow_temp_out', 'flow_temperature') : undefined,
+        hc_setpoint: z === 1 ? s('water_law_target_flow_temperature', 'water_target_in_use') : undefined,
+        room: s(`zone_${z}_indoor_temp`),
+        room_target: [`number.${p}_zone_${z}_target_temp`],
+        program: [`switch.${p}_away_mode`, `switch.${p}_outing_mode`],
+        energy_today: s('daily_energy_consumed'),
+        energy_total: s('total_consumed_energy', 'energy'),
+        heat_total: s('total_produced_energy', 'heat_produced_total'),
+        compressor_speed: s('compressor_frequency'),
+        hot_gas: s('discharge_temperature'),
+        eev: s('expansion_valve_opening'),
+      };
+    },
+    errors: (p) => [`sensor.${p}_error_code`, `sensor.${p}_system_error_status`],
+    // The text sensor for 0x8235 says "No Error"; any other text is a fault. As a plain sensor it is the number (0 = none).
+    error_ok: ['No Error'],
+    // Away (outing) mode is a switch.
+    program_map: { on: 'holiday', off: 'none' },
+    // The template sensors of Beormund's example.yaml give today; the NASA counters (0x8414, 0x4427) the totals.
+    tiles: (p) => {
+      const s = (...ks) => ks.map((k) => `sensor.${p}_${k}`);
+      return {
+        energy: { today: s('daily_energy_consumed'), total: s('total_consumed_energy', 'energy') },
+        heat: { today: s('daily_heat_generated'), total: s('total_produced_energy', 'heat_produced_total') },
+        cop_total: { today: s('cop_daily'), total: s('cop_total') },
       };
     },
   },
@@ -2181,8 +2245,8 @@ class HeatpumpFlowCard extends HTMLElement {
     const running = compOn || power > this._threshold || this._runningStates.includes(status)
       || (!this._has('compressor') && !this._has('power') && !this._has('status') && ['heating', 'dhw', 'cooling', 'defrost'].includes(hp));
     const defrost = hp === 'defrost' || status.toUpperCase().includes('DEFROST') || (this._has('defrost') && this._on('defrost'));
-    // Valve: binary (on = DHW) or a state such as "Tank" / "DHW".
-    const valveDhw = this._has('valve') && (this._on('valve') || ['tank', 'dhw', 'hot water', 'warmwasser'].includes(String(this._s('valve')).toLowerCase()));
+    // Valve: binary (on = DHW) or a state such as "Tank" / "DHW" ("Tank (DHW)" from Samsung NASA).
+    const valveDhw = this._has('valve') && (this._on('valve') || ['tank', 'tank (dhw)', 'dhw', 'hot water', 'warmwasser'].includes(String(this._s('valve')).toLowerCase()));
     // Integrations without an operating-mode entity: a running compressor means heating unless the valve says DHW.
     if (!this._has('mode')) hp = !running ? 'idle' : (defrost ? 'defrost' : (valveDhw ? 'dhw' : 'heating'));
     const cooling = hp === 'cooling' || bufMode === 'cooling';
@@ -2361,9 +2425,12 @@ class HeatpumpFlowCard extends HTMLElement {
     chip.textContent = `${modeTxt}${running ? ` · ${i.running}` : ''}`;
     chip.className = `chip mode-${defrost ? 'defrost' : cooling ? 'cool' : toDhw ? 'dhw' : toHeat ? 'heat' : 'idle'}`;
     this._badges.forEach((b, n) => this._cls(`chip-b${n}`, ['on', 'true', 'home', 'open'].includes(String(this._hass.states[b.entity]?.state).toLowerCase())));
+    // Text error sensors (preset error_ok, e.g. Samsung "No Error"): any other known text is a fault.
+    const errOk = this._preset?.error_ok || [];
     const errs = this._errors.filter((id) => {
       const st = this._hass.states[id]?.state; const v = parseFloat(st);
-      return (Number.isFinite(v) && v !== 0) || st === 'on';
+      return (Number.isFinite(v) && v !== 0) || st === 'on'
+        || (errOk.length > 0 && st !== undefined && !Number.isFinite(v) && !['unknown', 'unavailable', 'off', ''].includes(st) && !errOk.includes(st));
     });
     const prog = this._program();
     const pc = this._$('chip-program');
@@ -2746,7 +2813,7 @@ if (!window.customCards.some((c) => c.type === hfcType)) {
   window.customCards.push({
     type: hfcType,
     name: hfcGeneric ? 'Heatpump Flow Card' : 'Heatpump Hydraulic Card',
-    description: 'Animated hydraulic schematic for heat pumps (power sources, valve, tanks, heating circuit). Presets: Lambda, Viessmann, Vaillant, EMS-ESP (Bosch/Buderus/Junkers/Nefit), Panasonic Aquarea (HeishaMon).',
+    description: 'Animated hydraulic schematic for heat pumps (power sources, valve, tanks, heating circuit). Presets: Lambda, Viessmann, Vaillant, EMS-ESP (Bosch/Buderus/Junkers/Nefit), Panasonic Aquarea (HeishaMon), Samsung EHS.',
     preview: true,
     documentationURL: 'https://github.com/Sturmi77/heatpump-flow-card',
   });
